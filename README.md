@@ -19,7 +19,15 @@ Keys can also be supplied as `GEMINI_API_KEY`, `GROQ_API_KEY` or `OPENROUTER_API
 
 <img src="docs/settings.png" width="420" alt="Settings dialog">
 
-## Setup
+## Download (macOS)
+
+**[Download MathSnapDock-arm64.dmg](https://github.com/VirajSinghChadha/the-dock-of-life/releases/latest/download/MathSnapDock-arm64.dmg)** for Apple Silicon Macs. Open it and drag **MathSnap Dock** into Applications.
+
+The app is not notarized by Apple, so the first launch is blocked: open it once, then go to System Settings → Privacy & Security and click **Open Anyway**. Grant it Screen Recording, Accessibility and Input Monitoring there too.
+
+To build the DMG yourself (for example on an Intel Mac), run `./build_dmg.sh`.
+
+## Run from source
 
 ```bash
 pip install PyQt6 pillow google-genai "pynput>=1.7.7"
