@@ -39,10 +39,13 @@
 #   Option+Space (Alt+Space)  toggle the dock from anywhere
 #   📸 Capture Math           drag a red box around a problem; Esc/right-click cancels
 #   ✕                         hide the dock (Option+Space brings it back)
-#   Cmd+Q (Ctrl+Q)            quit, while the dock is focused
+#   ⏻  or Cmd+Q (Ctrl+Q)      quit (the app has no Dock icon, so it can float over
+#                             full-screen apps)
 # =============================================================================
 
 import base64
+import ctypes
+import ctypes.util
 import io
 import json
 import os
@@ -242,6 +245,74 @@ QComboBox QAbstractItemView {
 """
 
 STATUS_COLORS = {"Ready": "#34d399", "Capturing...": "#fbbf24", "Solving...": "#a78bfa"}
+
+
+# ---- macOS native helpers (ctypes, no extra dependency) ----------------------
+# Qt alone cannot put a window on top of another app's full-screen Space or check
+# the Screen Recording permission, so these talk to AppKit / CoreGraphics directly.
+
+IS_MAC = sys.platform == "darwin"
+MAC_LEVEL_PANEL = 25     # NSStatusWindowLevel: above normal and full-screen windows
+MAC_LEVEL_OVERLAY = 101  # NSPopUpMenuWindowLevel: above the panel, Dock and menu bar
+_objc = None
+if IS_MAC:
+    try:
+        _objc = ctypes.cdll.LoadLibrary(ctypes.util.find_library("objc"))
+        _objc.objc_getClass.restype = ctypes.c_void_p
+        _objc.objc_getClass.argtypes = [ctypes.c_char_p]
+        _objc.sel_registerName.restype = ctypes.c_void_p
+        _objc.sel_registerName.argtypes = [ctypes.c_char_p]
+    except Exception:
+        _objc = None
+
+
+def _mac_send(obj, selector: str, *args, restype=ctypes.c_void_p, argtypes=()):
+    send = ctypes.cast(_objc.objc_msgSend,
+                       ctypes.CFUNCTYPE(restype, ctypes.c_void_p, ctypes.c_void_p, *argtypes))
+    return send(obj, _objc.sel_registerName(selector.encode()), *args)
+
+
+def mac_run_as_accessory():
+    """No Dock icon / menu bar, which lets our windows sit over other apps' full-screen Spaces."""
+    if not _objc:
+        return
+    try:
+        app = _mac_send(_objc.objc_getClass(b"NSApplication"), "sharedApplication")
+        _mac_send(app, "setActivationPolicy:", 1, restype=ctypes.c_bool, argtypes=(ctypes.c_long,))
+    except Exception:
+        pass
+
+
+def mac_float_everywhere(widget, level: int):
+    """Show this window on every Space, including over full-screen apps. Call after show()."""
+    if not _objc:
+        return
+    try:
+        window = _mac_send(int(widget.winId()), "window")
+        if not window:
+            return
+        # canJoinAllSpaces | stationary | fullScreenAuxiliary
+        _mac_send(window, "setCollectionBehavior:", 1 | 16 | 256,
+                  restype=None, argtypes=(ctypes.c_ulong,))
+        _mac_send(window, "setLevel:", level, restype=None, argtypes=(ctypes.c_long,))
+        _mac_send(window, "setHidesOnDeactivate:", False, restype=None, argtypes=(ctypes.c_bool,))
+    except Exception:
+        pass
+
+
+def mac_screen_capture_allowed() -> bool:
+    """True if macOS lets us record other apps' windows. Prompts the user the first time."""
+    if not IS_MAC:
+        return True
+    try:
+        cg = ctypes.cdll.LoadLibrary(ctypes.util.find_library("CoreGraphics"))
+        cg.CGPreflightScreenCaptureAccess.restype = ctypes.c_bool
+        if cg.CGPreflightScreenCaptureAccess():
+            return True
+        cg.CGRequestScreenCaptureAccess.restype = ctypes.c_bool
+        return bool(cg.CGRequestScreenCaptureAccess())
+    except Exception:
+        return True  # very old macOS: no such API, and no permission needed
 
 
 def pixmap_to_png(pixmap: QPixmap) -> bytes:
@@ -671,6 +742,10 @@ class Dock(QWidget):
         close_btn = QPushButton("✕", objectName="ghost")
         close_btn.setToolTip("Hide (Option+Space to show again)")
         close_btn.clicked.connect(self.close_clicked)
+        quit_btn = QPushButton("⏻", objectName="ghost")
+        quit_btn.setToolTip("Quit MathSnap Dock")
+        quit_btn.clicked.connect(QApplication.quit)
+        top.addWidget(quit_btn)
         top.addWidget(close_btn)
         right.addLayout(top)
         right.addStretch(1)
@@ -682,7 +757,7 @@ class Dock(QWidget):
         right.addWidget(settings_btn)
         holder = QWidget()
         holder.setLayout(right)
-        holder.setFixedWidth(160)
+        holder.setFixedWidth(190)
         row.addWidget(holder)
 
     def set_status(self, text: str):
@@ -725,6 +800,7 @@ class Dock(QWidget):
         start = self.pos() if self.isVisible() else hidden
         self.move(start)
         self.show()
+        mac_float_everywhere(self, MAC_LEVEL_PANEL)
         self.raise_()
         self.activateWindow()
         self._visible = True
@@ -787,6 +863,17 @@ class Dock(QWidget):
     def start_capture(self):
         if self._overlay is not None:
             return
+        if not mac_screen_capture_allowed():
+            # Without this permission macOS hands back the wallpaper with every window removed.
+            self._show_error(
+                "macOS is blocking screen capture, so a snip would show only your wallpaper.\n\n"
+                "Open **System Settings → Privacy & Security → Screen & System Audio Recording**, "
+                "switch on **MathSnap Dock** (or the terminal you launched it from), then quit "
+                "with ⏻ and reopen the app.\n\n"
+                "If it is already switched on, remove it from that list with the − button, "
+                "add it again, and reopen the app.",
+                status="Permission needed")
+            return
         self.set_status("Capturing...")
         self.capture_btn.setEnabled(False)
         if self._anim is not None:
@@ -807,6 +894,7 @@ class Dock(QWidget):
         self._overlay.selected.connect(self._on_snip)
         self._overlay.cancelled.connect(self._on_snip_cancelled)
         self._overlay.show()
+        mac_float_everywhere(self._overlay, MAC_LEVEL_OVERLAY)
         self._overlay.raise_()
         self._overlay.activateWindow()
         self._overlay.setFocus()
@@ -902,6 +990,7 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName("MathSnap Dock")
     app.setQuitOnLastWindowClosed(False)  # hiding the dock must not quit the app
+    mac_run_as_accessory()
 
     dock = Dock()
     bridge = HotkeyBridge()

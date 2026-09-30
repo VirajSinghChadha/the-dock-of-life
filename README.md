@@ -42,4 +42,10 @@ On macOS, grant the app that launches Python (Terminal, iTerm, ...) **Screen Rec
 - 📸 Capture Math: drag a red box around a problem (Esc or right-click cancels)
 - ↻ Retry: re-solve the last snip, e.g. after switching provider
 - ✕: hide the dock
-- `Cmd+Q` / `Ctrl+Q`: quit
+- ⏻ or `Cmd+Q` / `Ctrl+Q`: quit
+
+The dock floats over every Space, including full-screen apps, so it has no Dock icon.
+
+## Snips show only the wallpaper?
+
+That means macOS Screen Recording permission is missing. Enable **MathSnap Dock** under System Settings → Privacy & Security → Screen & System Audio Recording, then quit and reopen the app. After installing a new version, remove the old entry with the − button and add the app again.
