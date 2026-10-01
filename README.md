@@ -39,12 +39,19 @@ On macOS, grant the app that launches Python (Terminal, iTerm, ...) **Screen Rec
 ## Usage
 
 - `Option+Space` / `Alt+Space`: show or hide the dock
-- 📸 Capture Math: drag a red box around a problem (Esc or right-click cancels)
-- ↻ Retry: re-solve the last snip, e.g. after switching provider
+- `Ctrl+Option+S` / `Ctrl+Alt+S`: snip straight away, even while the dock is hidden
+- 📸 Capture Math: drag a red box around a problem on whichever display the pointer is on (Esc or right-click cancels)
+- 📋 Paste image: solve a screenshot from the clipboard (on macOS, `Shift+Cmd+Ctrl+4` copies a region). You can also drop an image file onto the dock.
+- Mode: *Step by step*, *Answer only*, *Hint only* (no spoilers) or *Explain simply*
+- Follow-up box: ask a question about the current problem; the model sees the snip and the earlier answers
+- History ▾: reopen any of the last 20 problems from this session (kept in memory only)
+- ↻ Retry / ■ Stop: re-solve, e.g. after switching provider or mode, or stop a running answer
+- Copy: copies the latest answer, with LaTeX turned into readable text
+- 🔑 Settings → **Test connection**: checks the provider, model and key before you snip
 - ✕: hide the dock
 - ⏻ or `Cmd+Q` / `Ctrl+Q`: quit
 
-The dock floats over every Space, including full-screen apps, so it has no Dock icon.
+The dock floats over every Space, including full-screen apps, so it has no Dock icon. If the global hotkeys can't work (pynput missing, or no Accessibility permission on macOS), the dock says so and ✕ quits instead of hiding.
 
 ## Snips show only the wallpaper?
 
