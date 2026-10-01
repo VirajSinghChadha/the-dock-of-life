@@ -354,8 +354,12 @@ def mac_float_everywhere(widget, level: int):
         window = _mac_send(int(widget.winId()), "window")
         if not window:
             return
-        # canJoinAllSpaces | stationary | fullScreenAuxiliary
-        _mac_send(window, "setCollectionBehavior:", 1 | 16 | 256,
+        # canJoinAllSpaces | fullScreenAuxiliary — the documented combination for a
+        # utility window that must float over *every* Space, including one currently
+        # occupied by a native full-screen app. (Adding `stationary` here, as a
+        # previous version did, keeps the window from following the user onto a
+        # full-screen Space at all on current macOS.)
+        _mac_send(window, "setCollectionBehavior:", 1 | 256,
                   restype=None, argtypes=(ctypes.c_ulong,))
         _mac_send(window, "setLevel:", level, restype=None, argtypes=(ctypes.c_long,))
         _mac_send(window, "setHidesOnDeactivate:", False, restype=None, argtypes=(ctypes.c_bool,))
@@ -405,11 +409,10 @@ def screen_under_cursor():
     return QGuiApplication.screenAt(QCursor.pos()) or QGuiApplication.primaryScreen()
 
 
-def grab_screen(screen) -> QPixmap:
-    """Screenshot one display. Falls back to macOS's own `screencapture` tool if Qt fails."""
-    shot = screen.grabWindow(0)
-    if not shot.isNull() or not IS_MAC:
-        return shot
+def _grab_screen_cli(screen) -> QPixmap:
+    """Shell out to macOS's own `screencapture` tool, which (unlike Qt's grabWindow)
+    keeps working across rebuilds of an ad-hoc-signed app whose code signature
+    changes every time, and reliably includes full-screen apps' windows."""
     geo = screen.geometry()
     fd, path = tempfile.mkstemp(suffix=".png")
     os.close(fd)
@@ -427,6 +430,25 @@ def grab_screen(screen) -> QPixmap:
     finally:
         with contextlib.suppress(OSError):
             os.remove(path)  # the frozen frame lives in memory only
+
+
+def grab_screen(screen) -> QPixmap:
+    """Screenshot one display.
+
+    On macOS, Qt's grabWindow() uses a deprecated API that — once the Screen
+    Recording permission is missing or stale (very common for an ad-hoc-signed
+    app whose signature changes on every rebuild) — silently returns a
+    *non-null* image containing only the desktop picture and Dock, with every
+    other app's window invisible. That looks like success, so Qt is only used
+    as a fallback here; `screencapture` is the primary path and either raises
+    the real permission prompt or produces a complete capture.
+    """
+    if IS_MAC:
+        shot = _grab_screen_cli(screen)
+        if not shot.isNull():
+            return shot
+        return screen.grabWindow(0)
+    return screen.grabWindow(0)
 
 
 def pixmap_from_mime(mime):
