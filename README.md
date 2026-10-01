@@ -4,6 +4,19 @@
 
 ![MathSnap Dock](docs/dock.png)
 
+## What's new in 1.1
+
+> **Updated 1 October 2026.** Existing users see a one-time "updated" note in the dock after installing the new version.
+
+- **Screenshot fixes:** snip on whichever display the pointer is on, sharp Retina snips, exact selection size, and Esc always cancels
+- **`Ctrl+Option+S`** snips straight away, even while the dock is hidden
+- **📋 Paste image** from the clipboard, or drop an image file onto the dock
+- **Modes:** Step by step, Answer only, Hint only, Explain simply
+- **Follow-up questions**, **■ Stop**, **History ▾**, and readable math instead of raw LaTeX
+- **🔑 Settings → Test connection** to check your provider and key
+
+After updating, macOS may ask for permissions again: see [Snips show only the wallpaper?](#snips-show-only-the-wallpaper)
+
 ## Free AI options
 
 Pick one in **🔑 Settings**. The model name is editable for every provider.

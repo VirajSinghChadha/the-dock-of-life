@@ -169,6 +169,20 @@ PROVIDERS = {
 }
 DEFAULT_PROVIDER = "gemini"
 
+APP_VERSION = "1.1.1"
+# Shown once in the dock to existing users after they update.
+WHATS_NEW = (
+    f"**🎉 MathSnap Dock was updated to {APP_VERSION}**\n\n"
+    "- Snip on any display, with sharper Retina snips\n"
+    "- {capture} snips straight away, even with the dock hidden\n"
+    "- 📋 Paste image, or drop an image file onto the dock\n"
+    "- Modes: Step by step, Answer only, Hint only, Explain simply\n"
+    "- Ask follow-up questions, ■ Stop, History ▾, readable math\n"
+    "- 🔑 Settings → Test connection\n\n"
+    "If snips show only your wallpaper, re-add MathSnap Dock under System Settings → "
+    "Privacy & Security → Screen & System Audio Recording, then reopen the app."
+)
+
 HOTKEY = "<alt>+<space>"
 CAPTURE_HOTKEY = "<ctrl>+<alt>+s"
 TOGGLE_KEYS = "⌥Space" if sys.platform == "darwin" else "Alt+Space"
@@ -292,7 +306,7 @@ QMenu::item:disabled { color: #6f6e82; }
 """
 
 STATUS_COLORS = {"Ready": "#34d399", "Capturing...": "#fbbf24", "Solving...": "#a78bfa",
-                 "Stopped": "#9d9cb3", "No image": "#fbbf24"}
+                 "Stopped": "#9d9cb3", "No image": "#fbbf24", "Updated": "#34d399"}
 
 
 # ---- macOS native helpers (ctypes, no extra dependency) ----------------------
@@ -1471,16 +1485,27 @@ def main():
     listener = start_hotkey(bridge)
     dock.slide_in()
 
+    notices = []
+    seen = dock.settings.value("last_version", "", type=str)
+    is_existing_user = bool(seen) or "provider" in dock.settings.allKeys()
+    if seen != APP_VERSION:
+        dock.settings.setValue("last_version", APP_VERSION)
+        if is_existing_user:
+            notices.append(WHATS_NEW.replace("{capture}", CAPTURE_KEYS))
+            dock.set_status("Updated")
     if listener is None:
         dock.hotkey_available = False
-        dock._show_error(
-            f"The global {TOGGLE_KEYS} and {CAPTURE_KEYS} hotkeys are unavailable.\n\n"
+        notices.append(
+            f"**⚠️ Hotkey off**\n\nThe global {TOGGLE_KEYS} and {CAPTURE_KEYS} hotkeys are "
+            "unavailable.\n\n"
             "Install them with `pip install pynput` and, on macOS, switch on **MathSnap Dock** "
             "(or the app running Python) under **System Settings → Privacy & Security → "
             "Accessibility** and **Input Monitoring**, then reopen the app. Until then, the ✕ "
             "button quits the app instead of hiding it. 📸 Capture Math and 📋 Paste image "
-            "work without these permissions.",
-            status="Hotkey off")
+            "work without these permissions.")
+        dock.set_status("Hotkey off")
+    if notices:
+        dock.output.setMarkdown("\n\n---\n\n".join(notices))
 
     code = app.exec()
     if listener is not None:
