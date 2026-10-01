@@ -169,18 +169,16 @@ PROVIDERS = {
 }
 DEFAULT_PROVIDER = "gemini"
 
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.1.2"
 # Shown once in the dock to existing users after they update.
 WHATS_NEW = (
     f"**🎉 MathSnap Dock was updated to {APP_VERSION}**\n\n"
-    "- Snip on any display, with sharper Retina snips\n"
-    "- {capture} snips straight away, even with the dock hidden\n"
-    "- 📋 Paste image, or drop an image file onto the dock\n"
-    "- Modes: Step by step, Answer only, Hint only, Explain simply\n"
-    "- Ask follow-up questions, ■ Stop, History ▾, readable math\n"
-    "- 🔑 Settings → Test connection\n\n"
-    "If snips show only your wallpaper, re-add MathSnap Dock under System Settings → "
-    "Privacy & Security → Screen & System Audio Recording, then reopen the app."
+    "- Fixed snips that captured only the desktop wallpaper\n"
+    "- Fixed the dock/overlay not appearing over full-screen apps\n"
+    "- Fixed a broken code signature that could make Gatekeeper report the app as damaged\n\n"
+    "If macOS still shows a stale permission, remove MathSnap Dock under System Settings → "
+    "Privacy & Security → Screen Recording (and Accessibility/Input Monitoring), then re-add "
+    "it and reopen the app."
 )
 
 HOTKEY = "<alt>+<space>"
