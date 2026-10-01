@@ -37,20 +37,32 @@
 # USAGE
 # -----
 #   Option+Space (Alt+Space)  toggle the dock from anywhere
-#   📸 Capture Math           drag a red box around a problem; Esc/right-click cancels
+#   Ctrl+Option+S             snip straight away, even while the dock is hidden
+#   📸 Capture Math           drag a red box around a problem on any display;
+#                             Esc/right-click cancels
+#   📋 Paste / drag & drop    solve an image from the clipboard or a file
+#   Mode                      full steps, answer only, a hint, or a beginner explanation
+#   Follow-up box             ask a question about the current problem
+#   History ▾                 reopen an earlier problem from this session
+#   ↻ Retry / ■ Stop          re-solve (e.g. after switching provider) or stop
 #   ✕                         hide the dock (Option+Space brings it back)
 #   ⏻  or Cmd+Q (Ctrl+Q)      quit (the app has no Dock icon, so it can float over
 #                             full-screen apps)
 # =============================================================================
 
 import base64
+import contextlib
 import ctypes
 import ctypes.util
 import io
 import json
 import os
+import re
+import subprocess
 import sys
+import tempfile
 import threading
+import time
 import urllib.error
 import urllib.request
 
@@ -58,10 +70,12 @@ from PyQt6.QtCore import (
     QBuffer, QEasingCurve, QIODevice, QObject, QPoint, QPropertyAnimation, QRect,
     QSettings, Qt, QTimer, pyqtSignal,
 )
-from PyQt6.QtGui import QColor, QGuiApplication, QKeySequence, QPainter, QPen, QPixmap, QShortcut
+from PyQt6.QtGui import (
+    QColor, QCursor, QGuiApplication, QImage, QKeySequence, QPainter, QPen, QPixmap, QShortcut,
+)
 from PyQt6.QtWidgets import (
     QApplication, QComboBox, QDialog, QFrame, QGraphicsDropShadowEffect, QHBoxLayout,
-    QLabel, QLineEdit, QPushButton, QTextBrowser, QVBoxLayout, QWidget,
+    QLabel, QLineEdit, QMenu, QPushButton, QSizePolicy, QTextBrowser, QVBoxLayout, QWidget,
 )
 
 try:
@@ -87,11 +101,31 @@ PROMPT = (
     "or word problem in this cropped image. Provide a clear, step-by-step explanation "
     "and conclude with the final boxed answer."
 )
+# Solve modes: id -> (menu label, instruction sent with the image)
+MODES = {
+    "steps": ("Step by step", PROMPT),
+    "answer": ("Answer only", (
+        "You are an expert Math Tutor. Identify the mathematical problem in this cropped image "
+        "and give only the final answer, with at most one short line of justification.")),
+    "hint": ("Hint only", (
+        "You are a patient Math Tutor. Identify the mathematical problem in this cropped image. "
+        "Do NOT solve it and do NOT reveal the final answer. Give one helpful hint for the next "
+        "step, and name the concept or formula that applies.")),
+    "explain": ("Explain simply", (
+        "You are a friendly Math Tutor talking to a beginner. Identify the mathematical problem "
+        "in this cropped image, explain the idea behind it in plain words, then solve it in small "
+        "steps, explaining why each step works. End with the final answer.")),
+}
+DEFAULT_MODE = "steps"
 # The solution view renders Markdown but not LaTeX, so steer the output format.
 FORMAT_HINT = (
     "Format the reply in Markdown. Write math in plain text / Unicode "
     "(e.g. x², √, ×, ÷, fractions as a/b) instead of LaTeX."
 )
+
+
+def mode_prompt(mode: str) -> str:
+    return MODES.get(mode, MODES[DEFAULT_MODE])[1] + "\n\n" + FORMAT_HINT
 
 # Every provider here can be used for free. "openai" kind = OpenAI-compatible
 # /chat/completions endpoint, called with the standard library only.
@@ -136,11 +170,16 @@ PROVIDERS = {
 DEFAULT_PROVIDER = "gemini"
 
 HOTKEY = "<alt>+<space>"
-PANEL_HEIGHT = 230
+CAPTURE_HOTKEY = "<ctrl>+<alt>+s"
+TOGGLE_KEYS = "⌥Space" if sys.platform == "darwin" else "Alt+Space"
+CAPTURE_KEYS = "⌃⌥S" if sys.platform == "darwin" else "Ctrl+Alt+S"
+PANEL_HEIGHT = 262
 PANEL_WIDTH_RATIO = 0.75
 SHADOW_MARGIN = 18
 MIN_SELECTION = 8      # logical px; anything smaller counts as a cancelled snip
 MAX_IMAGE_SIDE = 1600  # px; larger snips are downscaled before upload
+MAX_HISTORY = 20       # problems kept (in memory only) for the History menu
+IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tif", ".tiff", ".heic")
 
 STYLE = """
 #dock {
@@ -208,6 +247,7 @@ QPushButton:disabled { color: #6f6e82; }
 #ghost { background: transparent; border: none; color: #9d9cb3; padding: 3px 8px; font-size: 13px; }
 #ghost:hover { background: rgba(255, 255, 255, 22); color: #ffffff; }
 #mini { padding: 3px 10px; font-size: 11px; border-radius: 9px; }
+#mini::menu-indicator { image: none; width: 0; }
 QTextBrowser {
     background: rgba(8, 8, 16, 120);
     color: #ecebf5;
@@ -242,9 +282,17 @@ QComboBox QAbstractItemView {
 }
 #note { color: #9d9cb3; font-size: 11px; }
 #note a, QLabel a { color: #c4b5fd; }
+QMenu {
+    background: #211f2e; color: #ecebf5; border: 1px solid rgba(255, 255, 255, 30);
+    border-radius: 8px; padding: 4px;
+}
+QMenu::item { padding: 6px 14px; border-radius: 6px; }
+QMenu::item:selected { background: #7c3aed; }
+QMenu::item:disabled { color: #6f6e82; }
 """
 
-STATUS_COLORS = {"Ready": "#34d399", "Capturing...": "#fbbf24", "Solving...": "#a78bfa"}
+STATUS_COLORS = {"Ready": "#34d399", "Capturing...": "#fbbf24", "Solving...": "#a78bfa",
+                 "Stopped": "#9d9cb3", "No image": "#fbbf24"}
 
 
 # ---- macOS native helpers (ctypes, no extra dependency) ----------------------
@@ -285,7 +333,8 @@ def mac_run_as_accessory():
 
 def mac_float_everywhere(widget, level: int):
     """Show this window on every Space, including over full-screen apps. Call after show()."""
-    if not _objc:
+    # winId() is only an NSView on the Cocoa platform plugin; messaging anything else crashes.
+    if not _objc or QGuiApplication.platformName() != "cocoa":
         return
     try:
         window = _mac_send(int(widget.winId()), "window")
@@ -298,6 +347,29 @@ def mac_float_everywhere(widget, level: int):
         _mac_send(window, "setHidesOnDeactivate:", False, restype=None, argtypes=(ctypes.c_bool,))
     except Exception:
         pass
+
+
+def mac_activate_app():
+    """Bring our accessory app to the front so its windows receive key presses (e.g. Esc)."""
+    if not _objc:
+        return
+    try:
+        app = _mac_send(_objc.objc_getClass(b"NSApplication"), "sharedApplication")
+        _mac_send(app, "activateIgnoringOtherApps:", True, restype=None, argtypes=(ctypes.c_bool,))
+    except Exception:
+        pass
+
+
+def mac_input_monitoring_allowed() -> bool:
+    """False if macOS will silently swallow our global hotkeys (no Accessibility permission)."""
+    if not IS_MAC:
+        return True
+    try:
+        ax = ctypes.cdll.LoadLibrary(ctypes.util.find_library("ApplicationServices"))
+        ax.AXIsProcessTrusted.restype = ctypes.c_bool
+        return bool(ax.AXIsProcessTrusted())
+    except Exception:
+        return True
 
 
 def mac_screen_capture_allowed() -> bool:
@@ -313,6 +385,120 @@ def mac_screen_capture_allowed() -> bool:
         return bool(cg.CGRequestScreenCaptureAccess())
     except Exception:
         return True  # very old macOS: no such API, and no permission needed
+
+
+def screen_under_cursor():
+    return QGuiApplication.screenAt(QCursor.pos()) or QGuiApplication.primaryScreen()
+
+
+def grab_screen(screen) -> QPixmap:
+    """Screenshot one display. Falls back to macOS's own `screencapture` tool if Qt fails."""
+    shot = screen.grabWindow(0)
+    if not shot.isNull() or not IS_MAC:
+        return shot
+    geo = screen.geometry()
+    fd, path = tempfile.mkstemp(suffix=".png")
+    os.close(fd)
+    try:
+        subprocess.run(
+            ["/usr/sbin/screencapture", "-x", "-R",
+             f"{geo.x()},{geo.y()},{geo.width()},{geo.height()}", path],
+            capture_output=True, timeout=15, check=False)
+        shot = QPixmap(path)
+        if not shot.isNull():
+            shot.setDevicePixelRatio(shot.width() / max(1, geo.width()))
+        return shot
+    except Exception:
+        return QPixmap()
+    finally:
+        with contextlib.suppress(OSError):
+            os.remove(path)  # the frozen frame lives in memory only
+
+
+def pixmap_from_mime(mime):
+    """An image from a clipboard / drag-and-drop payload: image files first, then raw pixels."""
+    if mime is None:
+        return None
+    for url in mime.urls():
+        if url.isLocalFile() and url.toLocalFile().lower().endswith(IMAGE_SUFFIXES):
+            pix = QPixmap(url.toLocalFile())
+            if not pix.isNull():
+                return pix
+    if mime.hasImage():
+        data = mime.imageData()
+        if isinstance(data, QImage) and not data.isNull():
+            return QPixmap.fromImage(data)
+        if isinstance(data, QPixmap) and not data.isNull():
+            return data
+    return None
+
+
+def mime_has_image(mime) -> bool:
+    return mime.hasImage() or any(
+        u.isLocalFile() and u.toLocalFile().lower().endswith(IMAGE_SUFFIXES) for u in mime.urls())
+
+
+# ---- LaTeX cleanup -------------------------------------------------------------
+# Models often answer in LaTeX despite FORMAT_HINT; QTextBrowser can't render it, so
+# turn the common commands into readable Unicode.
+
+_LATEX_SYMBOLS = {
+    "times": "×", "cdot": "·", "div": "÷", "pm": "±", "mp": "∓", "le": "≤", "leq": "≤",
+    "ge": "≥", "geq": "≥", "neq": "≠", "ne": "≠", "approx": "≈", "equiv": "≡", "infty": "∞",
+    "pi": "π", "theta": "θ", "alpha": "α", "beta": "β", "gamma": "γ", "delta": "δ",
+    "Delta": "Δ", "lambda": "λ", "mu": "μ", "sigma": "σ", "Sigma": "Σ", "omega": "ω",
+    "phi": "φ", "epsilon": "ε", "to": "→", "rightarrow": "→", "Rightarrow": "⇒",
+    "implies": "⇒", "iff": "⇔", "sum": "∑", "prod": "∏", "int": "∫", "partial": "∂",
+    "nabla": "∇", "circ": "°", "degree": "°", "angle": "∠", "perp": "⊥", "parallel": "∥",
+    "in": "∈", "notin": "∉", "subset": "⊂", "cup": "∪", "cap": "∩", "emptyset": "∅",
+    "forall": "∀", "exists": "∃", "therefore": "∴", "cdots": "⋯", "ldots": "…", "dots": "…",
+    "left": "", "right": "", "displaystyle": "", "quad": "  ", "qquad": "    ",
+    "sin": "sin", "cos": "cos", "tan": "tan", "log": "log", "ln": "ln", "lim": "lim",
+}
+_SUPERSCRIPT = str.maketrans("0123456789+-=()nix", "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾ⁿⁱˣ")
+_SUBSCRIPT = str.maketrans("0123456789+-=()", "₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎")
+_GROUP = r"\{([^{}]*)\}"
+
+
+def _script(text: str, table, marker: str) -> str:
+    converted = text.translate(table)
+    if all(ord(ch) > 127 for ch in converted):
+        return converted
+    return f"{marker}({text})" if len(text) > 1 else marker + text
+
+
+def _wrap(text: str) -> str:
+    text = text.strip()
+    return text if re.fullmatch(r"[\w.√²³]+", text) else f"({text})"
+
+
+def latex_to_text(text: str) -> str:
+    if "\\" not in text and "$" not in text:
+        return text
+    for _ in range(8):  # innermost braces first, so nested commands unwrap step by step
+        before = text
+        text = re.sub(r"\\[dt]?frac" + _GROUP + _GROUP,
+                      lambda m: f"{_wrap(m[1])}/{_wrap(m[2])}", text)
+        text = re.sub(r"\\sqrt\[([^\]]*)\]" + _GROUP,
+                      lambda m: f"{m[1].translate(_SUPERSCRIPT)}√{_wrap(m[2])}", text)
+        text = re.sub(r"\\sqrt" + _GROUP, lambda m: f"√{_wrap(m[1])}", text)
+        text = re.sub(r"\\boxed" + _GROUP, r"**\1**", text)
+        text = re.sub(r"\\(?:text|mathrm|mathbf|mathit|operatorname|textbf)" + _GROUP, r"\1", text)
+        text = re.sub(r"\^" + _GROUP, lambda m: _script(m[1], _SUPERSCRIPT, "^"), text)
+        text = re.sub(r"_" + _GROUP, lambda m: _script(m[1], _SUBSCRIPT, "_"), text)
+        if text == before:
+            break
+    text = re.sub(r"\\(?:begin|end)\{[a-z*]+\}", "", text)
+    text = re.sub(r"\s*\\\\\s*", "\n\n", text)  # \\ line breaks
+    text = re.sub(r"\s*&\s*([=<>≤≥≈])", r" \1", text)  # aligned-environment anchors
+    text = re.sub(r"\^([0-9n])", lambda m: m[1].translate(_SUPERSCRIPT), text)
+    text = re.sub(r"\^\\circ", "°", text)
+    text = re.sub(r"\\([A-Za-z]+)", lambda m: _LATEX_SYMBOLS.get(m[1], m[0]), text)
+    text = re.sub(r"\\[,;:! ]", " ", text)
+    text = text.replace("\\{", "{").replace("\\}", "}")
+    text = re.sub(r"\\\[|\\\]|\\\(|\\\)|\$\$", "", text)
+    text = re.sub(r"\$(?=\S)([^$\n]+?)(?<=\S)\$(?!\d)", r"\1", text)
+    return text
 
 
 def pixmap_to_png(pixmap: QPixmap) -> bytes:
@@ -360,28 +546,34 @@ def friendly_error(exc: Exception, provider_id: str) -> str:
 
 
 class HotkeyBridge(QObject):
-    """Marshals the pynput listener thread's callback onto the Qt main thread."""
+    """Marshals the pynput listener thread's callbacks onto the Qt main thread."""
     triggered = pyqtSignal()
+    capture = pyqtSignal()
 
 
 class Solver(QObject):
-    """Streams a model response from a background thread."""
+    """Streams a model response from a background thread.
+
+    `turns` is the conversation so far: dicts with "role" ("user" / "assistant"), "text" and,
+    for the turn that carries the snip, "image": True.
+    """
     chunk = pyqtSignal(int, str)
     finished = pyqtSignal(int)
     failed = pyqtSignal(int, str)
 
-    def solve(self, job_id: int, provider_id: str, model: str, api_key: str, png: bytes) -> None:
-        threading.Thread(target=self._run, args=(job_id, provider_id, model, api_key, png),
+    def solve(self, job_id: int, provider_id: str, model: str, api_key: str,
+              png, turns: list) -> None:
+        threading.Thread(target=self._run, args=(job_id, provider_id, model, api_key, png, turns),
                          daemon=True).start()
 
-    def _run(self, job_id, provider_id, model, api_key, png):
+    def _run(self, job_id, provider_id, model, api_key, png, turns):
         provider = PROVIDERS[provider_id]
         try:
-            png = shrink_png(png)
+            png = shrink_png(png) if png else None
             if provider["kind"] == "gemini":
-                pieces = self._gemini(model, api_key, png)
+                pieces = self._gemini(model, api_key, png, turns)
             else:
-                pieces = self._openai_compatible(provider["base_url"], model, api_key, png)
+                pieces = self._openai_compatible(provider["base_url"], model, api_key, png, turns)
             got_text = False
             for text in pieces:
                 if text:
@@ -396,34 +588,34 @@ class Solver(QObject):
             self.failed.emit(job_id, friendly_error(exc, provider_id))
 
     @staticmethod
-    def _gemini(model, api_key, png):
+    def _gemini(model, api_key, png, turns):
         if genai is None:
             raise RuntimeError("The google-genai package is not installed. Run: pip install google-genai")
         client = genai.Client(api_key=api_key)
-        stream = client.models.generate_content_stream(
-            model=model,
-            contents=[
-                genai_types.Part.from_bytes(data=png, mime_type="image/png"),
-                PROMPT + "\n\n" + FORMAT_HINT,
-            ],
-        )
-        for part in stream:
+        contents = []
+        for turn in turns:
+            parts = []
+            if turn.get("image") and png:
+                parts.append(genai_types.Part.from_bytes(data=png, mime_type="image/png"))
+            parts.append(genai_types.Part.from_text(text=turn["text"]))
+            contents.append(genai_types.Content(
+                role="user" if turn["role"] == "user" else "model", parts=parts))
+        for part in client.models.generate_content_stream(model=model, contents=contents):
             yield part.text
 
     @staticmethod
-    def _openai_compatible(base_url, model, api_key, png):
-        body = json.dumps({
-            "model": model,
-            "stream": True,
-            "messages": [{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": PROMPT + "\n\n" + FORMAT_HINT},
+    def _openai_compatible(base_url, model, api_key, png, turns):
+        messages = []
+        for turn in turns:
+            content = turn["text"]
+            if turn.get("image") and png:
+                content = [
+                    {"type": "text", "text": turn["text"]},
                     {"type": "image_url", "image_url": {
                         "url": "data:image/png;base64," + base64.b64encode(png).decode("ascii")}},
-                ],
-            }],
-        }).encode("utf-8")
+                ]
+            messages.append({"role": turn["role"], "content": content})
+        body = json.dumps({"model": model, "stream": True, "messages": messages}).encode("utf-8")
         headers = {"Content-Type": "application/json", "User-Agent": "MathSnapDock/1.0",
                    "X-Title": "MathSnap Dock"}
         if api_key:
@@ -478,7 +670,10 @@ class SnipOverlay(QWidget):
     def _selection(self) -> QRect:
         if self._origin is None or self._current is None:
             return QRect()
-        return QRect(self._origin, self._current).normalized().intersected(self.rect())
+        # QRect(QPoint, QPoint) counts both corners in, which makes the box 1px too big.
+        x1, x2 = sorted((self._origin.x(), self._current.x()))
+        y1, y2 = sorted((self._origin.y(), self._current.y()))
+        return QRect(x1, y1, x2 - x1, y2 - y1).intersected(self.rect())
 
     def _source_rect(self, rect: QRect) -> QRect:
         # Map widget (logical) coordinates to screenshot (device) pixels.
@@ -560,6 +755,12 @@ class SettingsDialog(QDialog):
         self.dock = dock
         self._current = None
         self._pending = {}  # provider id -> (model, key) edited but not yet saved
+        self._test_job = 0
+        self._test_reply = ""
+        self._tester = Solver()
+        self._tester.chunk.connect(self._on_test_chunk)
+        self._tester.finished.connect(self._on_test_done)
+        self._tester.failed.connect(self._on_test_failed)
         self.setWindowTitle("MathSnap Settings")
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint)
         self.setMinimumWidth(460)
@@ -592,7 +793,17 @@ class SettingsDialog(QDialog):
         layout.addWidget(self.key_edit)
         layout.addSpacing(10)
 
+        self.test_result = QLabel(objectName="note")
+        self.test_result.setWordWrap(True)
+        self.test_result.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.test_result.hide()
+        layout.addWidget(self.test_result)
+
         buttons = QHBoxLayout()
+        self.test_btn = QPushButton("Test connection")
+        self.test_btn.setToolTip("Send a tiny text request with these settings")
+        self.test_btn.clicked.connect(self._test)
+        buttons.addWidget(self.test_btn)
         buttons.addStretch(1)
         cancel = QPushButton("Cancel")
         cancel.clicked.connect(self.reject)
@@ -631,6 +842,55 @@ class SettingsDialog(QDialog):
             self.key_edit.setPlaceholderText("Not needed — runs locally")
             link = f'<a style="color:#c4b5fd" href="{info["key_url"]}">Download Ollama</a>'
         self.note.setText(f'{info["note"]} {link}')
+        self._test_job += 1
+        self.test_btn.setEnabled(True)
+        self.test_result.hide()
+
+    def _test(self):
+        pid = self._current
+        info = PROVIDERS[pid]
+        model = self.model_edit.text().strip() or info["model"]
+        key = self.key_edit.text().strip()
+        for name in info["env"]:
+            key = key or os.environ.get(name, "").strip()
+        if info["env"] and not key:
+            self._show_test_result("Paste an API key first.", ok=False)
+            return
+        self._test_job += 1
+        self._test_reply = ""
+        self.test_btn.setEnabled(False)
+        self._show_test_result(f"Testing {model}...", ok=None)
+        self._tester.solve(self._test_job, pid, model, key, None,
+                           [{"role": "user", "text": "Reply with exactly: OK"}])
+
+    def _on_test_chunk(self, job_id, text):
+        if job_id == self._test_job:
+            self._test_reply += text
+
+    def _on_test_done(self, job_id):
+        if job_id == self._test_job:
+            self.test_btn.setEnabled(True)
+            reply = self._test_reply.strip().replace("\n", " ")[:80]
+            self._show_test_result(f"✓ Connected. The model replied: {reply}", ok=True)
+
+    def _on_test_failed(self, job_id, message):
+        if job_id == self._test_job:
+            self.test_btn.setEnabled(True)
+            self._show_test_result("✗ " + message, ok=False)
+
+    def _show_test_result(self, text, ok):
+        color = {True: "#34d399", False: "#fb7185"}.get(ok, "#9d9cb3")
+        self.test_result.setStyleSheet(f"color: {color};")
+        self.test_result.setText(text)
+        self.test_result.show()
+
+    def done(self, result):
+        # A test request may still be running; make sure it can't touch this closed dialog.
+        self._test_job += 1
+        for signal in (self._tester.chunk, self._tester.finished, self._tester.failed):
+            with contextlib.suppress(TypeError, RuntimeError):
+                signal.disconnect()
+        super().done(result)
 
     def _save(self):
         self._stash()
@@ -641,6 +901,29 @@ class SettingsDialog(QDialog):
         settings.setValue("provider", self._current)
         settings.sync()
         self.accept()
+
+
+class Session:
+    """One problem: the snip plus the conversation about it. Kept in memory only."""
+
+    def __init__(self, png: bytes, pixmap: QPixmap, mode: str):
+        self.png = png
+        self.pixmap = pixmap
+        self.created = time.strftime("%H:%M")
+        self.turns = [{"role": "user", "text": mode_prompt(mode), "image": True}]
+
+    def last_answer(self) -> str:
+        for turn in reversed(self.turns):
+            if turn["role"] == "assistant" and turn["text"]:
+                return turn["text"]
+        return ""
+
+    def title(self) -> str:
+        for line in latex_to_text(self.last_answer()).splitlines():
+            line = line.strip(" #*>-_`")
+            if line:
+                return line[:48] + ("…" if len(line) > 48 else "")
+        return "(no answer)"
 
 
 class Dock(QWidget):
@@ -655,12 +938,14 @@ class Dock(QWidget):
         self.solver.finished.connect(self._on_finished)
         self.solver.failed.connect(self._on_failed)
         self._job_id = 0
-        self._answer = ""
+        self._job_turn = None   # assistant turn the running job streams into
+        self._job_session = None
+        self._session = None    # problem currently shown
+        self._history = []      # earlier problems this session, oldest first
         self._overlay = None
         self._anim = None
         self._visible = False
         self.hotkey_available = True
-        self._last_png = None
 
         self.setWindowTitle("MathSnap Dock")
         self.setWindowFlags(
@@ -671,11 +956,15 @@ class Dock(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         # Qt.Tool windows vanish on macOS when the app loses focus unless this is set.
         self.setAttribute(Qt.WidgetAttribute.WA_MacAlwaysShowToolWindow)
+        self.setAcceptDrops(True)
         self.setStyleSheet(STYLE)
         self._build_ui()
         QShortcut(QKeySequence.StandardKey.Quit, self, activated=QApplication.quit)
+        # A focused text field handles Cmd+V itself, so this only fires elsewhere in the dock.
+        QShortcut(QKeySequence.StandardKey.Paste, self, activated=self.paste_image)
         self.set_status("Ready")
         self._refresh_badge()
+        self._update_buttons()
 
     # ---- UI ---------------------------------------------------------------
 
@@ -699,8 +988,9 @@ class Dock(QWidget):
         left.addWidget(QLabel("∑  MathSnap", objectName="brand"))
         self.capture_btn = QPushButton("📸  Capture Math", objectName="capture")
         self.capture_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.capture_btn.setToolTip(f"Snip a problem on any display ({CAPTURE_KEYS})")
         self.capture_btn.clicked.connect(self.start_capture)
-        self.thumb = QLabel("Your snip appears here", objectName="thumb")
+        self.thumb = QLabel("Your snip appears here\nor drop / paste an image", objectName="thumb")
         self.thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.thumb.setFixedWidth(190)
         self.thumb.setMinimumHeight(70)
@@ -708,19 +998,28 @@ class Dock(QWidget):
         left.addWidget(self.thumb, 1)
         row.addLayout(left)
 
-        # Middle: solution
+        # Middle: solution and follow-up box
         middle = QVBoxLayout()
         middle.setSpacing(6)
         head = QHBoxLayout()
         head.addWidget(QLabel("SOLUTION", objectName="section"))
         self.badge = QLabel(objectName="badge")
+        self.badge.setMaximumWidth(280)
+        # Let the badge shrink before the buttons next to it get squashed on small screens.
+        self.badge.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.badge.setMinimumWidth(60)
         head.addWidget(self.badge)
         head.addStretch(1)
+        self.history_btn = QPushButton("History ▾", objectName="mini")
+        self.history_btn.setToolTip("Reopen an earlier problem from this session")
+        self.history_menu = QMenu(self)
+        self.history_menu.aboutToShow.connect(self._fill_history_menu)
+        self.history_btn.setMenu(self.history_menu)
         self.retry_btn = QPushButton("↻ Retry", objectName="mini")
-        self.retry_btn.setEnabled(False)
-        self.retry_btn.clicked.connect(self.retry)
+        self.retry_btn.clicked.connect(self.retry_or_stop)
         self.copy_btn = QPushButton("Copy", objectName="mini")
         self.copy_btn.clicked.connect(self.copy_answer)
+        head.addWidget(self.history_btn)
         head.addWidget(self.retry_btn)
         head.addWidget(self.copy_btn)
         middle.addLayout(head)
@@ -728,11 +1027,16 @@ class Dock(QWidget):
         self.output.setOpenExternalLinks(True)
         self.output.setPlaceholderText(
             "Capture a math problem and the step-by-step solution will appear here.\n"
-            "Tip: press Option+Space anywhere to show or hide this dock.")
+            f"Tip: press {TOGGLE_KEYS} anywhere to show or hide this dock, "
+            f"or {CAPTURE_KEYS} to snip straight away.")
         middle.addWidget(self.output, 1)
+        self.followup = QLineEdit()
+        self.followup.setPlaceholderText("Ask a follow-up about this problem, then press Enter")
+        self.followup.returnPressed.connect(self.ask_followup)
+        middle.addWidget(self.followup)
         row.addLayout(middle, 1)
 
-        # Right: close, status, settings
+        # Right: status, close, mode, paste, settings
         right = QVBoxLayout()
         right.setSpacing(8)
         top = QHBoxLayout()
@@ -740,7 +1044,7 @@ class Dock(QWidget):
         top.addWidget(self.status)
         top.addStretch(1)
         close_btn = QPushButton("✕", objectName="ghost")
-        close_btn.setToolTip("Hide (Option+Space to show again)")
+        close_btn.setToolTip(f"Hide ({TOGGLE_KEYS} to show again)")
         close_btn.clicked.connect(self.close_clicked)
         quit_btn = QPushButton("⏻", objectName="ghost")
         quit_btn.setToolTip("Quit MathSnap Dock")
@@ -748,8 +1052,20 @@ class Dock(QWidget):
         top.addWidget(quit_btn)
         top.addWidget(close_btn)
         right.addLayout(top)
+        self.mode_box = QComboBox()
+        self.mode_box.setToolTip("How much of the solution to show")
+        for mode_id, (label, _) in MODES.items():
+            self.mode_box.addItem(label, mode_id)
+        self.mode_box.setCurrentIndex(max(0, self.mode_box.findData(self.mode())))
+        self.mode_box.currentIndexChanged.connect(
+            lambda: self.settings.setValue("mode", self.mode_box.currentData()))
+        right.addWidget(self.mode_box)
+        paste_btn = QPushButton("📋  Paste image")
+        paste_btn.setToolTip("Solve an image from the clipboard. You can also drop an image file here.")
+        paste_btn.clicked.connect(self.paste_image)
+        right.addWidget(paste_btn)
         right.addStretch(1)
-        hint = QLabel("⌥ Space  to toggle", objectName="sub")
+        hint = QLabel(f"{TOGGLE_KEYS} toggle  ·  {CAPTURE_KEYS} snip", objectName="sub")
         hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         right.addWidget(hint)
         settings_btn = QPushButton("🔑  Settings")
@@ -768,6 +1084,30 @@ class Dock(QWidget):
         pid = self.provider_id()
         name = PROVIDERS[pid]["label"].split("·")[0].strip()
         self.badge.setText(f"{name} · {self.model_for(pid)}")
+
+    def _solving(self) -> bool:
+        return self._job_turn is not None
+
+    def _update_buttons(self):
+        solving = self._solving()
+        has_session = self._session is not None
+        self.retry_btn.setText("■ Stop" if solving else "↻ Retry")
+        self.retry_btn.setToolTip("Stop this answer" if solving else
+                                  "Ask again, e.g. after switching provider or mode")
+        self.retry_btn.setEnabled(solving or has_session)
+        self.copy_btn.setEnabled(bool(has_session and self._session.last_answer()))
+        self.history_btn.setEnabled(bool(self._history))
+        self.followup.setEnabled(has_session and not solving)
+
+    def _set_thumb(self, pixmap: QPixmap):
+        # Scale in device pixels so the preview stays sharp on Retina screens.
+        dpr = self.devicePixelRatioF()
+        size = self.thumb.contentsRect().size()
+        scaled = pixmap.scaled(round(size.width() * dpr), round(size.height() * dpr),
+                               Qt.AspectRatioMode.KeepAspectRatio,
+                               Qt.TransformationMode.SmoothTransformation)
+        scaled.setDevicePixelRatio(dpr)
+        self.thumb.setPixmap(scaled)
 
     # ---- Positioning / toggle ----------------------------------------------
 
@@ -826,8 +1166,8 @@ class Dock(QWidget):
             QApplication.quit()
 
     def toggle(self):
-        if self._overlay is not None:
-            return  # mid-snip; ignore the hotkey
+        if self._overlay is not None or QApplication.activeModalWidget() is not None:
+            return  # mid-snip or in Settings; ignore the hotkey
         if self._visible:
             self.slide_out()
         else:
@@ -842,6 +1182,10 @@ class Dock(QWidget):
     def model_for(self, pid: str) -> str:
         return self.settings.value(f"{pid}/model", "", type=str).strip() or PROVIDERS[pid]["model"]
 
+    def mode(self) -> str:
+        mode = self.settings.value("mode", DEFAULT_MODE, type=str)
+        return mode if mode in MODES else DEFAULT_MODE
+
     def stored_key(self, pid: str) -> str:
         return self.settings.value(f"{pid}/api_key", "", type=str).strip()
 
@@ -855,46 +1199,53 @@ class Dock(QWidget):
         saved = SettingsDialog(self).exec() == QDialog.DialogCode.Accepted
         if saved:
             self._refresh_badge()
-            self.set_status("Ready")
+            if not self._solving():
+                self.set_status("Ready")
         return saved
 
-    # ---- Capture flow -------------------------------------------------------
+    # ---- Getting an image: snip, paste, drop ----------------------------------
 
     def start_capture(self):
-        if self._overlay is not None:
+        if self._overlay is not None or QApplication.activeModalWidget() is not None:
             return
         if not mac_screen_capture_allowed():
             # Without this permission macOS hands back the wallpaper with every window removed.
+            self.slide_in()
             self._show_error(
                 "macOS is blocking screen capture, so a snip would show only your wallpaper.\n\n"
                 "Open **System Settings → Privacy & Security → Screen & System Audio Recording**, "
                 "switch on **MathSnap Dock** (or the terminal you launched it from), then quit "
                 "with ⏻ and reopen the app.\n\n"
                 "If it is already switched on, remove it from that list with the − button, "
-                "add it again, and reopen the app.",
+                "add it again, and reopen the app.\n\n"
+                "Meanwhile you can take a screenshot with ⇧⌘⌃4 and use 📋 Paste image.",
                 status="Permission needed")
             return
         self.set_status("Capturing...")
         self.capture_btn.setEnabled(False)
+        screen = screen_under_cursor()  # snip whichever display the pointer is on
         if self._anim is not None:
             self._anim.stop()
         self.hide()
         # Give the window server time to actually remove the panel from the screen.
-        QTimer.singleShot(250, self._grab_and_show_overlay)
+        QTimer.singleShot(250, lambda: self._grab_and_show_overlay(screen))
 
-    def _grab_and_show_overlay(self):
-        screen = QGuiApplication.primaryScreen()
-        shot = screen.grabWindow(0)
+    def _grab_and_show_overlay(self, screen):
+        if screen not in QGuiApplication.screens():  # display unplugged meanwhile
+            screen = QGuiApplication.primaryScreen()
+        shot = grab_screen(screen)
         if shot.isNull():
             self._restore_panel()
             self._show_error("Could not capture the screen. On macOS, grant Screen Recording "
-                             "permission to the app running Python, then restart it.")
+                             "permission to MathSnap Dock (or the app running Python), then "
+                             "restart it. You can still use 📋 Paste image meanwhile.")
             return
         self._overlay = SnipOverlay(screen, shot)
         self._overlay.selected.connect(self._on_snip)
         self._overlay.cancelled.connect(self._on_snip_cancelled)
         self._overlay.show()
         mac_float_everywhere(self._overlay, MAC_LEVEL_OVERLAY)
+        mac_activate_app()  # otherwise Esc goes to whatever app was in front
         self._overlay.raise_()
         self._overlay.activateWindow()
         self._overlay.setFocus()
@@ -906,79 +1257,200 @@ class Dock(QWidget):
 
     def _on_snip_cancelled(self):
         self._restore_panel()
-        self.set_status("Ready")
+        self.set_status("Solving..." if self._solving() else "Ready")
 
     def _on_snip(self, crop: QPixmap):
         self._restore_panel()
-        self._last_png = pixmap_to_png(crop)  # in-memory buffer; nothing is written to disk
-        self.retry_btn.setEnabled(True)
-        self.thumb.setPixmap(crop.scaled(
-            self.thumb.contentsRect().size(),
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation))
-        self._solve(self._last_png)
+        self.new_problem(crop)
 
-    # ---- Solving ------------------------------------------------------------
+    def paste_image(self):
+        pixmap = pixmap_from_mime(QGuiApplication.clipboard().mimeData())
+        if pixmap is None:
+            self.set_status("No image")
+            self.output.setMarkdown(
+                "**The clipboard has no image.** Copy a screenshot (on macOS ⇧⌘⌃4 copies a "
+                "region straight to the clipboard) or an image file, then press 📋 Paste image.")
+            return
+        self.slide_in()
+        self.new_problem(pixmap)
 
-    def retry(self):
-        if self._last_png:
-            self._solve(self._last_png)
+    def dragEnterEvent(self, event):
+        if mime_has_image(event.mimeData()):
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        pixmap = pixmap_from_mime(event.mimeData())
+        if pixmap is not None:
+            event.acceptProposedAction()
+            self.new_problem(pixmap)
+
+    # ---- Problems, history and follow-ups ------------------------------------
+
+    def new_problem(self, pixmap: QPixmap):
+        png = pixmap_to_png(pixmap)  # in-memory buffer; nothing is written to disk
+        session = Session(png, pixmap, self.mode())
+        self._history.append(session)
+        del self._history[:-MAX_HISTORY]
+        self._show_session(session)
+        self._solve()
+
+    def _show_session(self, session: Session):
+        self._session = session
+        self._set_thumb(session.pixmap)
+        self.followup.clear()
+        self._render()
+        self._update_buttons()
+
+    def _fill_history_menu(self):
+        self.history_menu.clear()
+        for session in reversed(self._history):
+            action = self.history_menu.addAction(f"{session.created}   {session.title()}")
+            action.setCheckable(True)
+            action.setChecked(session is self._session)
+            action.triggered.connect(lambda _=False, s=session: self._show_session(s))
+        self.history_menu.addSeparator()
+        clear = self.history_menu.addAction("Clear history")
+        clear.triggered.connect(self._clear_history)
+
+    def _clear_history(self):
+        self._stop()
+        self._history.clear()
+        self._session = None
+        self.thumb.clear()
+        self.thumb.setText("Your snip appears here\nor drop / paste an image")
+        self.output.clear()
+        self.set_status("Ready")
+        self._update_buttons()
+
+    def ask_followup(self):
+        question = self.followup.text().strip()
+        if not question or self._session is None or self._solving():
+            return
+        self.followup.clear()
+        self._session.turns.append({"role": "user", "text": question})
+        self._solve()
+
+    def retry_or_stop(self):
+        if self._solving():
+            self._stop()
+            return
+        session = self._session
+        if session is None:
+            return
+        if session.turns[-1]["role"] == "assistant":
+            session.turns.pop()
+        if len(session.turns) == 1:  # first answer: pick up a newly chosen mode too
+            session.turns[0]["text"] = mode_prompt(self.mode())
+        self._solve()
+
+    def _stop(self):
+        if not self._solving():
+            return
+        self._job_id += 1  # the background stream keeps running but is ignored from now on
+        self._job_turn["text"] += "\n\n*(stopped)*"
+        self._job_turn = None
+        self.set_status("Stopped")
+        self._render()
+        self._update_buttons()
 
     def copy_answer(self):
-        if self._answer:
-            QGuiApplication.clipboard().setText(self._answer)
+        answer = self._session.last_answer() if self._session else ""
+        if answer:
+            QGuiApplication.clipboard().setText(latex_to_text(answer))
             self.copy_btn.setText("Copied ✓")
             QTimer.singleShot(1200, lambda: self.copy_btn.setText("Copy"))
 
-    def _solve(self, png: bytes):
+    # ---- Solving ------------------------------------------------------------
+
+    def _solve(self):
+        session = self._session
         pid = self.provider_id()
-        needs_key = bool(PROVIDERS[pid]["env"])
-        if needs_key and not self.api_key(pid):
+        if PROVIDERS[pid]["env"] and not self.api_key(pid):
             self._show_error("No API key set for this provider. Add a free one in 🔑 Settings "
                              "(or switch to Ollama, which needs no key), then press ↻ Retry.",
                              status="No API key")
-            if not self.open_settings():
+            if not self.open_settings() or session is not self._session:
                 return
             pid = self.provider_id()
             if PROVIDERS[pid]["env"] and not self.api_key(pid):
                 return
+        self._stop()
+        # Earlier replies that failed or were empty would only confuse the model.
+        turns = [{k: v for k, v in t.items() if k != "error"} for t in session.turns
+                 if t["role"] == "user" or (t["text"] and not t.get("error"))]
         self._job_id += 1
-        self._answer = ""
-        self.output.clear()
+        self._job_turn = {"role": "assistant", "text": ""}
+        session.turns.append(self._job_turn)
+        self._job_session = session
         self.set_status("Solving...")
-        self.solver.solve(self._job_id, pid, self.model_for(pid), self.api_key(pid), png)
+        self._render()
+        self._update_buttons()
+        self.solver.solve(self._job_id, pid, self.model_for(pid), self.api_key(pid),
+                          session.png, turns)
+
+    def _render(self, keep_scroll=False):
+        session = self._session
+        if session is None:
+            return
+        parts = []
+        for i, turn in enumerate(session.turns):
+            if turn["role"] == "user":
+                if i > 0:
+                    parts.append(f"**🙋 {turn['text']}**")
+                continue
+            body = latex_to_text(turn["text"])
+            if turn.get("error"):
+                body = (body + "\n\n---\n\n" if body else "") + f"**⚠️ Error**\n\n{turn['error']}"
+            elif not body and turn is self._job_turn:
+                body = "*Thinking…*"
+            parts.append(body)
+        bar = self.output.verticalScrollBar()
+        at_bottom = bar.value() >= bar.maximum() - 4
+        old_value = bar.value()
+        self.output.setMarkdown("\n\n---\n\n".join(p for p in parts if p))
+        if keep_scroll and not at_bottom:
+            bar.setValue(old_value)
+        else:
+            bar.setValue(bar.maximum())
 
     def _on_chunk(self, job_id: int, text: str):
         if job_id != self._job_id:
-            return  # stale stream from an earlier capture
-        self._answer += text
-        bar = self.output.verticalScrollBar()
-        at_bottom = bar.value() >= bar.maximum() - 4
-        self.output.setMarkdown(self._answer)
-        if at_bottom:
-            bar.setValue(bar.maximum())
+            return  # stale stream from an earlier or stopped request
+        self._job_turn["text"] += text
+        if self._job_session is self._session:
+            self._render(keep_scroll=True)
 
     def _on_finished(self, job_id: int):
-        if job_id == self._job_id:
-            self.set_status("Ready")
+        if job_id != self._job_id:
+            return
+        self._job_turn = None
+        self.set_status("Ready")
+        self._update_buttons()
 
     def _on_failed(self, job_id: int, message: str):
         if job_id != self._job_id:
             return
-        prefix = self._answer + "\n\n---\n\n" if self._answer else ""
-        self._show_error(message, prefix=prefix)
+        self._job_turn["error"] = message
+        self._job_turn = None
+        self.set_status("Error")
+        if self._job_session is self._session:
+            self._render()
+        self._update_buttons()
 
-    def _show_error(self, message: str, status: str = "Error", prefix: str = ""):
-        self.output.setMarkdown(f"{prefix}**⚠️ {status}**\n\n{message}")
+    def _show_error(self, message: str, status: str = "Error"):
+        self.output.setMarkdown(f"**⚠️ {status}**\n\n{message}")
         self.set_status(status)
 
 
 def start_hotkey(bridge: HotkeyBridge):
-    """Register the global Option/Alt+Space hotkey. Returns the listener or None."""
-    if pynput_keyboard is None:
-        return None
+    """Register the global toggle and capture hotkeys. Returns the listener or None."""
+    if pynput_keyboard is None or not mac_input_monitoring_allowed():
+        return None  # on macOS pynput would start but never see a key press
     try:
-        listener = pynput_keyboard.GlobalHotKeys({HOTKEY: bridge.triggered.emit})
+        listener = pynput_keyboard.GlobalHotKeys({
+            HOTKEY: bridge.triggered.emit,
+            CAPTURE_HOTKEY: bridge.capture.emit,
+        })
         listener.daemon = True
         listener.start()
         return listener
@@ -995,16 +1467,19 @@ def main():
     dock = Dock()
     bridge = HotkeyBridge()
     bridge.triggered.connect(dock.toggle)
+    bridge.capture.connect(dock.start_capture)
     listener = start_hotkey(bridge)
     dock.slide_in()
 
     if listener is None:
         dock.hotkey_available = False
         dock._show_error(
-            "The global Option+Space hotkey is unavailable.\n\n"
-            "Install it with `pip install pynput` and, on macOS, grant Accessibility and "
-            "Input Monitoring permission to the app running Python. Until then, the ✕ "
-            "button quits the app instead of hiding it.",
+            f"The global {TOGGLE_KEYS} and {CAPTURE_KEYS} hotkeys are unavailable.\n\n"
+            "Install them with `pip install pynput` and, on macOS, switch on **MathSnap Dock** "
+            "(or the app running Python) under **System Settings → Privacy & Security → "
+            "Accessibility** and **Input Monitoring**, then reopen the app. Until then, the ✕ "
+            "button quits the app instead of hiding it. 📸 Capture Math and 📋 Paste image "
+            "work without these permissions.",
             status="Hotkey off")
 
     code = app.exec()
