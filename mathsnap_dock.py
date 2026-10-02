@@ -32,12 +32,12 @@
 # then restart that app:
 #   * Screen Recording  — otherwise captures show only your wallpaper.
 #   * Accessibility and Input Monitoring — needed for the global
-#     Option+Space hotkey. Without them the hotkey silently does nothing.
+#     Ctrl+Cmd+M hotkey. Without them the hotkey silently does nothing.
 #
 # USAGE
 # -----
-#   Option+Space (Alt+Space)  toggle the dock from anywhere
-#   Ctrl+Option+S             snip straight away, even while the dock is hidden
+#   Ctrl+Cmd+M                toggle the dock from anywhere
+#   Ctrl+Cmd+S                snip straight away, even while the dock is hidden
 #   📸 Capture Math           drag a red box around a problem on any display;
 #                             Esc/right-click cancels
 #   📋 Paste / drag & drop    solve an image from the clipboard or a file
@@ -45,7 +45,7 @@
 #   Follow-up box             ask a question about the current problem
 #   History ▾                 reopen an earlier problem from this session
 #   ↻ Retry / ■ Stop          re-solve (e.g. after switching provider) or stop
-#   ✕                         hide the dock (Option+Space brings it back)
+#   ✕                         hide the dock (Ctrl+Cmd+M brings it back)
 #   ⏻  or Cmd+Q (Ctrl+Q)      quit (the app has no Dock icon, so it can float over
 #                             full-screen apps)
 # =============================================================================
@@ -169,22 +169,26 @@ PROVIDERS = {
 }
 DEFAULT_PROVIDER = "gemini"
 
-APP_VERSION = "1.1.2"
+APP_VERSION = "1.1.3"
 # Shown once in the dock to existing users after they update.
 WHATS_NEW = (
     f"**🎉 MathSnap Dock was updated to {APP_VERSION}**\n\n"
-    "- Fixed snips that captured only the desktop wallpaper\n"
-    "- Fixed the dock/overlay not appearing over full-screen apps\n"
-    "- Fixed a broken code signature that could make Gatekeeper report the app as damaged\n\n"
+    "- Hotkeys changed to Ctrl+Cmd+M (toggle) and Ctrl+Cmd+S (snip) — Option+Space is the "
+    "default global hotkey for Raycast, Alfred, and other launchers, so it often never "
+    "reached this app\n"
+    "- Clearer guidance when Screen Recording is off after an update\n\n"
     "If macOS still shows a stale permission, remove MathSnap Dock under System Settings → "
     "Privacy & Security → Screen Recording (and Accessibility/Input Monitoring), then re-add "
     "it and reopen the app."
 )
 
-HOTKEY = "<alt>+<space>"
-CAPTURE_HOTKEY = "<ctrl>+<alt>+s"
-TOGGLE_KEYS = "⌥Space" if sys.platform == "darwin" else "Alt+Space"
-CAPTURE_KEYS = "⌃⌥S" if sys.platform == "darwin" else "Ctrl+Alt+S"
+# Ctrl+Cmd (not Option/Alt+Space) on purpose: Option+Space is the default
+# global hotkey for Raycast, Alfred, and several other launchers, so pynput's
+# listener was silently losing the keystroke to whichever of those ran first.
+HOTKEY = "<ctrl>+<cmd>+m"
+CAPTURE_HOTKEY = "<ctrl>+<cmd>+s"
+TOGGLE_KEYS = "⌃⌘M" if sys.platform == "darwin" else "Ctrl+Win+M"
+CAPTURE_KEYS = "⌃⌘S" if sys.platform == "darwin" else "Ctrl+Win+S"
 PANEL_HEIGHT = 262
 PANEL_WIDTH_RATIO = 0.75
 SHADOW_MARGIN = 18
@@ -1247,11 +1251,13 @@ class Dock(QWidget):
             self.slide_in()
             self._show_error(
                 "macOS is blocking screen capture, so a snip would show only your wallpaper.\n\n"
-                "Open **System Settings → Privacy & Security → Screen & System Audio Recording**, "
-                "switch on **MathSnap Dock** (or the terminal you launched it from), then quit "
-                "with ⏻ and reopen the app.\n\n"
-                "If it is already switched on, remove it from that list with the − button, "
-                "add it again, and reopen the app.\n\n"
+                "Open **System Settings → Privacy & Security → Screen & System Audio Recording** "
+                "and check the toggle next to **MathSnap Dock** (or the terminal you launched it "
+                "from) is switched **on** — every rebuild of this app signs it with a new, "
+                "unsigned identity, so macOS silently turns the toggle back off and may list "
+                "more than one **MathSnap Dock** entry. Turn on the one that matches where you "
+                "just opened the app from, remove the others with the − button, then quit with "
+                "⏻ and reopen.\n\n"
                 "Meanwhile you can take a screenshot with ⇧⌘⌃4 and use 📋 Paste image.",
                 status="Permission needed")
             return

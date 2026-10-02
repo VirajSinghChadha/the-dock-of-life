@@ -51,8 +51,8 @@ On macOS, grant the app that launches Python (Terminal, iTerm, ...) **Screen Rec
 
 ## Usage
 
-- `Option+Space` / `Alt+Space`: show or hide the dock
-- `Ctrl+Option+S` / `Ctrl+Alt+S`: snip straight away, even while the dock is hidden
+- `Ctrl+Cmd+M`: show or hide the dock
+- `Ctrl+Cmd+S`: snip straight away, even while the dock is hidden
 - 📸 Capture Math: drag a red box around a problem on whichever display the pointer is on (Esc or right-click cancels)
 - 📋 Paste image: solve a screenshot from the clipboard (on macOS, `Shift+Cmd+Ctrl+4` copies a region). You can also drop an image file onto the dock.
 - Mode: *Step by step*, *Answer only*, *Hint only* (no spoilers) or *Explain simply*
