@@ -34,7 +34,7 @@ Keys can also be supplied as `GEMINI_API_KEY`, `GROQ_API_KEY` or `OPENROUTER_API
 
 ## Download (macOS)
 
-**[Download MathSnapDock-arm64.dmg](https://github.com/VirajSinghChadha/the-dock-of-life/releases/latest/download/MathSnapDock-arm64.dmg)** for Apple Silicon Macs. Open it and drag **MathSnap Dock** into Applications.
+**[Download MathSnapDock-1.1.2-update-arm64.dmg](installers/MathSnapDock-1.1.2-update-arm64.dmg)** for Apple Silicon Macs. Open it and drag **MathSnap Dock** into Applications.
 
 The app is not notarized by Apple, so the first launch is blocked: open it once, then go to System Settings → Privacy & Security and click **Open Anyway**. Grant it Screen Recording, Accessibility and Input Monitoring there too.
 
